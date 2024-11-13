@@ -1,0 +1,452 @@
+
+"""
+Interactive Vertex AI Model Deployment Manager
+-------------------------------------------
+This script helps you manage your Vertex AI model deployments by:
+1. Automatically detecting regions with active endpoints
+2. Listing all endpoints and deployed models in used regions
+3. Allowing you to select models to undeploy through an interactive menu
+4. Optionally deleting undeployed models
+"""
+
+# Import required libraries
+from google.cloud import aiplatform
+import os
+from google.colab import auth
+from google.cloud.aiplatform import initializer
+from google.cloud.aiplatform.compat.types import endpoint_service
+import time
+from google.api_core import exceptions
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+class ModelManager:
+    def __init__(self):
+        self.project_id = None
+        self.active_regions = []
+        self.endpoints_info = []
+        self.selected_region = None
+
+    def check_region_for_endpoints(self, region):
+        """Check if a region has any endpoints with enhanced error handling"""
+        try:
+            # Create client options for the specific region
+            client_options = {"api_endpoint": f"{region}-aiplatform.googleapis.com"}
+            
+            # Initialize for the specific region
+            aiplatform.init(project=self.project_id, location=region)
+            
+            # Try both direct API client and Vertex AI SDK approaches
+            try:
+                # Method 1: Using Vertex AI SDK
+                endpoints_sdk = aiplatform.Endpoint.list()
+                if endpoints_sdk:
+                    return region, len(endpoints_sdk)
+            except Exception as sdk_error:
+                try:
+                    # Method 2: Using API client directly
+                    endpoint_client = aiplatform.gapic.EndpointServiceClient(client_options=client_options)
+                    parent = f"projects/{self.project_id}/locations/{region}"
+                    endpoints_api = endpoint_client.list_endpoints(parent=parent)
+                    
+                    # Convert iterator to list to check if there are any endpoints
+                    endpoints_list = list(endpoints_api)
+                    if endpoints_list:
+                        return region, len(endpoints_list)
+                except Exception as api_error:
+                    pass
+                    
+        except Exception:
+            pass
+        return None, 0
+        
+    def detect_active_regions(self):
+        """Detect regions that have active endpoints with improved coverage"""
+        print("\nDetecting regions with active endpoints...")
+        print("This may take a few minutes for comprehensive scanning...")
+        
+        # Comprehensive list of GCP regions
+        all_regions = [
+            # Americas
+            "us-central1", "us-east1", "us-east4", "us-west1", "us-west2", "us-west3", "us-west4",
+            "northamerica-northeast1", "northamerica-northeast2",
+            "southamerica-east1", "southamerica-west1",
+            
+            # Europe
+            "europe-central2", "europe-north1",
+            "europe-west1", "europe-west2", "europe-west3", "europe-west4", "europe-west6", 
+            "europe-west8", "europe-west9",
+            
+            # Asia
+            "asia-east1", "asia-east2",
+            "asia-northeast1", "asia-northeast2", "asia-northeast3",
+            "asia-south1", "asia-south2",
+            "asia-southeast1", "asia-southeast2",
+            
+            # Other regions
+            "australia-southeast1", "australia-southeast2",
+            "me-west1",
+            "africa-south1"
+        ]
+        
+        active_regions = []
+        total_endpoints = 0
+        
+        print("\nScanning regions:")
+        print("-" * 50)
+        
+        # Use ThreadPoolExecutor with increased timeout
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_region = {
+                executor.submit(self.check_region_for_endpoints, region): region 
+                for region in all_regions
+            }
+            
+            for future in as_completed(future_to_region):
+                region = future_to_region[future]
+                try:
+                    result_region, num_endpoints = future.result(timeout=30)
+                    if result_region:
+                        active_regions.append((result_region, num_endpoints))
+                        total_endpoints += num_endpoints
+                        print(f"✓ {result_region:<20} - Found {num_endpoints} endpoints")
+                    else:
+                        print(f"- {region:<20} - No endpoints found")
+                except Exception as e:
+                    print(f"× {region:<20} - Error checking region")
+                    continue
+
+        # Sort regions by number of endpoints (descending) and then by name
+        active_regions.sort(key=lambda x: (-x[1], x[0]))
+        self.active_regions = [region for region, _ in active_regions]
+        
+        if not self.active_regions:
+            print("\nNo regions with active endpoints found.")
+            return False
+            
+        print("\nSummary of regions with active endpoints:")
+        print("=" * 50)
+        print(f"{'Index':<6} {'Region':<20} {'Endpoints':<10}")
+        print("-" * 50)
+        for idx, (region, num_endpoints) in enumerate(active_regions):
+            print(f"{idx:<6} {region:<20} {num_endpoints:<10}")
+        print("=" * 50)
+        print(f"Total endpoints found: {total_endpoints}")
+        
+        return True
+
+    def authenticate_and_initialize(self):
+        """Authenticate user and get project ID with improved error handling"""
+        try:
+            # Authenticate
+            auth.authenticate_user()
+            print("\nAuthentication successful.")
+            
+            # Get project ID
+            while True:
+                project_id = input("\nPlease enter your Google Cloud Project ID: ").strip()
+                if project_id:
+                    try:
+                        self.project_id = project_id
+                        print("\nScanning for active endpoints across all regions...")
+                        print("This may take a few minutes for the initial scan...")
+                        
+                        # Detect active regions
+                        if not self.detect_active_regions():
+                            print("No active endpoints found in any region.")
+                            return False
+                        
+                        # Select region
+                        while True:
+                            try:
+                                region_idx = int(input("\nSelect a region by entering its index number: "))
+                                if 0 <= region_idx < len(self.active_regions):
+                                    self.selected_region = self.active_regions[region_idx]
+                                    print(f"Selected region: {self.selected_region}")
+                                    break
+                                else:
+                                    print("Invalid region index. Please try again.")
+                            except ValueError:
+                                print("Please enter a valid number.")
+                        
+                        print(f"Successfully connected to project: {project_id}")
+                        break
+                    except Exception as e:
+                        print(f"Error connecting to project: {str(e)}")
+                        retry = input("Would you like to try another Project ID? (yes/no): ").strip().lower()
+                        if retry != 'yes':
+                            return False
+                else:
+                    print("Project ID cannot be empty.")
+            
+            return True
+                    
+        except Exception as e:
+            print(f"\nAuthentication failed: {str(e)}")
+            return False
+
+    def list_all_endpoints(self):
+        """List all endpoints and their deployed models in selected region"""
+        self.endpoints_info = []  # Reset endpoints info
+        
+        print(f"\nScanning for Vertex AI endpoints in region {self.selected_region}...")
+        print("This may take a few moments...")
+        
+        try:
+            # Initialize for selected region
+            aiplatform.init(project=self.project_id, location=self.selected_region)
+            endpoints = aiplatform.Endpoint.list()
+            
+            if endpoints:
+                print(f"\nEndpoints in {self.selected_region}:")
+                print("=" * 120)
+                print(f"{'Index':<6} {'Endpoint ID':<25} {'Display Name':<30} {'Model Count':<10}")
+                print("=" * 120)
+                
+                for endpoint in endpoints:
+                    endpoint_id = endpoint.resource_name.split('/')[-1]
+                    display_name = endpoint.display_name if hasattr(endpoint, 'display_name') else "N/A"
+                    model_count = len(endpoint.gca_resource.deployed_models)
+                    
+                    # Get deployed model details
+                    deployed_models = self.get_deployed_models_details(endpoint)
+                    
+                    # Store endpoint info
+                    endpoint_info = {
+                        'endpoint_id': endpoint_id,
+                        'display_name': display_name,
+                        'deployed_models': deployed_models
+                    }
+                    self.endpoints_info.append(endpoint_info)
+                    
+                    # Display endpoint info with index
+                    index = len(self.endpoints_info) - 1
+                    print(f"{index:<6} {endpoint_id:<25} {display_name:<30} {model_count:<10}")
+                    
+                    if deployed_models:
+                        for model in deployed_models:
+                            print(f"  ├─ Model: {model['name']}")
+                            print(f"  │  ├─ Model ID: {model['model_id']}")
+                            print(f"  │  └─ Deployed Model ID: {model['deployed_model_id']}")
+                    print("-" * 120)
+            else:
+                print(f"No endpoints found in region {self.selected_region}")
+                
+        except Exception as e:
+            print(f"Error listing endpoints: {str(e)}")
+            
+        return len(self.endpoints_info) > 0
+
+    def get_deployed_models_details(self, endpoint):
+        """Get details of models deployed in an endpoint"""
+        try:
+            deployed_models = endpoint.gca_resource.deployed_models
+            model_details = []
+            
+            for deployed_model in deployed_models:
+                model_path = deployed_model.model
+                model_id = model_path.split('/')[-1]
+                model_name = deployed_model.display_name if hasattr(deployed_model, 'display_name') else model_id
+                
+                model_details.append({
+                    'name': model_name,
+                    'model_id': model_id,
+                    'deployed_model_id': deployed_model.id,
+                    'full_path': model_path
+                })
+            
+            return model_details
+        except Exception as e:
+            print(f"Error getting deployed models: {str(e)}")
+            return []
+
+    def get_user_selection(self):
+        """Get user selection for endpoint and model"""
+        while True:
+            try:
+                print("\nSelect an endpoint by entering its index number:")
+                endpoint_index = int(input("Endpoint index: "))
+                
+                if 0 <= endpoint_index < len(self.endpoints_info):
+                    selected_endpoint = self.endpoints_info[endpoint_index]
+                    
+                    print("\nDeployed models in selected endpoint:")
+                    for i, model in enumerate(selected_endpoint['deployed_models']):
+                        print(f"{i}: {model['name']} (Deployed Model ID: {model['deployed_model_id']})")
+                    
+                    model_index = int(input("\nSelect a model by entering its index number: "))
+                    
+                    if 0 <= model_index < len(selected_endpoint['deployed_models']):
+                        selected_model = selected_endpoint['deployed_models'][model_index]
+                        
+                        print(f"\nSelected configuration:")
+                        print(f"Region: {self.selected_region}")
+                        print(f"Endpoint ID: {selected_endpoint['endpoint_id']}")
+                        print(f"Model: {selected_model['name']}")
+                        print(f"Deployed Model ID: {selected_model['deployed_model_id']}")
+                        
+                        delete_after = input("\nDelete model after undeployment? (yes/no): ").strip().lower() == 'yes'
+                        
+                        return (
+                            selected_endpoint['endpoint_id'],
+                            selected_model['deployed_model_id'],
+                            selected_model['model_id'],
+                            selected_model['name'],
+                            delete_after
+                        )
+                    else:
+                        print("Invalid model index. Please try again.")
+                else:
+                    print("Invalid endpoint index. Please try again.")
+            except ValueError:
+                print("Please enter a valid number.")
+            except Exception as e:
+                print(f"Error: {str(e)}")
+            
+            retry = input("\nWould you like to try selection again? (yes/no): ").strip().lower()
+            if retry != 'yes':
+                return None
+
+    def undeploy_model(self, endpoint_id, deployed_model_id):
+        """Undeploy a specific model from an endpoint"""
+        try:
+            print(f"\nUndeploying model {deployed_model_id} from endpoint {endpoint_id} in region {self.selected_region}...")
+            
+            # Initialize for selected region
+            aiplatform.init(project=self.project_id, location=self.selected_region)
+            
+            # Get the endpoint
+            endpoint = aiplatform.Endpoint(
+                endpoint_name=f'projects/{self.project_id}/locations/{self.selected_region}/endpoints/{endpoint_id}'
+            )
+            
+            # Create endpoint service client
+            client_options = {"api_endpoint": f"{self.selected_region}-aiplatform.googleapis.com"}
+            endpoint_client = aiplatform.gapic.EndpointServiceClient(client_options=client_options)
+            
+            # Create the request
+            request = endpoint_service.UndeployModelRequest(
+                endpoint=endpoint.resource_name,
+                deployed_model_id=deployed_model_id
+            )
+            
+            # Make the request
+            print("Initiating undeployment...")
+            operation = endpoint_client.undeploy_model(request=request)
+            
+            # Wait for operation to complete
+            print("Waiting for undeployment to complete...")
+            operation.result(timeout=300)  # 5 minutes timeout
+            
+            print("Successfully undeployed model")
+            return True
+                
+        except Exception as e:
+            print(f"Error in undeploying model: {str(e)}")
+            return False
+
+    def delete_model(self, model_id):
+        """Delete a specific model"""
+        try:
+            print(f"\nAttempting to delete model {model_id} in region {self.selected_region}...")
+            
+            # Initialize for selected region
+            aiplatform.init(project=self.project_id, location=self.selected_region)
+            
+            try:
+                # Create model client
+                api_endpoint = f"{self.selected_region}-aiplatform.googleapis.com"
+                client_options = {"api_endpoint": api_endpoint}
+                model_client = aiplatform.gapic.ModelServiceClient(client_options=client_options)
+                
+                # Get the full resource name
+                model_name = f'projects/{self.project_id}/locations/{self.selected_region}/models/{model_id}'
+                
+                # Try to get the model first to verify it exists
+                try:
+                    model_client.get_model(name=model_name)
+                except exceptions.NotFound:
+                    print(f"Model {model_id} not found or already deleted")
+                    return True
+                    
+                # Create delete request
+                operation = model_client.delete_model(name=model_name)
+                
+                # Wait for the deletion to complete
+                print("Waiting for deletion to complete...")
+                operation.result(timeout=300)  # 5 minutes timeout
+                
+                print(f"Successfully deleted model {model_id}")
+                return True
+                
+            except exceptions.NotFound:
+                print(f"Model {model_id} was already deleted")
+                return True
+            except Exception as delete_error:
+                raise delete_error
+                    
+        except Exception as e:
+            print(f"Error deleting model: {str(e)}")
+            return False
+
+def main():
+    """Main function to manage Vertex AI deployments"""
+    print("Welcome to Vertex AI Model Deployment Manager")
+    print("-------------------------------------------")
+    
+    manager = ModelManager()
+    
+    # Authenticate and get project ID and region
+    if not manager.authenticate_and_initialize():
+        print("Failed to initialize. Exiting...")
+        return
+    
+    # List all endpoints and their models
+    if not manager.list_all_endpoints():
+        print("No endpoints found in the selected region. Exiting...")
+        return
+    
+    # Get user selection
+    selection = manager.get_user_selection()
+    if not selection:
+        print("Selection cancelled. Exiting...")
+        return
+    
+    endpoint_id, deployed_model_id, model_id, model_name, delete_after = selection
+    
+    # Confirm operation
+    print(f"\nYou are about to:")
+    print(f"1. Undeploy model '{model_name}' from endpoint {endpoint_id}")
+    if delete_after:
+        print(f"2. Delete model '{model_name}' after undeployment")
+    
+    proceed = input("\nDo you want to proceed? (yes/no): ")
+    if proceed.lower() != 'yes':
+        print("Operation cancelled")
+        return
+    
+    # Step 1: Undeploy the model
+    print("\nStep 1: Undeploying model...")
+    undeploy_success = manager.undeploy_model(endpoint_id, deployed_model_id)
+    
+    if undeploy_success:
+        print("Waiting 30 seconds for undeployment to fully process...")
+        time.sleep(30)
+        
+        if delete_after:
+            # Step 2: Delete the model
+            print(f"\nStep 2: Deleting model {model_name} (ID: {model_id})...")
+            delete_success = manager.delete_model(model_id)
+            
+            if delete_success:
+                print("\nCleanup process completed successfully!")
+            else:
+                print("\nFailed to delete model. Please check the errors above.")
+    else:
+        print("\nFailed to undeploy model. Cannot proceed with deletion.")
+    
+    # Show final state
+    print("\nFinal state of endpoints:")
+    manager.list_all_endpoints()
+
+if __name__ == "__main__":
+    main()
